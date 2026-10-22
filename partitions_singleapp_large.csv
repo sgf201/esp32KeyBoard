@@ -1,0 +1,14 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+# Partition layout for the 16MB flash on this ESP32-S3 module.
+#
+#   0x00000 - 0x08000  bootloader
+#   0x08000 - 0x09000  partition table
+#   0x09000 - 0x0F000  nvs          (24K)
+#   0x0F000 - 0x10000  phy_init     (4K)
+#   0x10000 - 0x410000 factory app  (4M)
+#   0x410000 - 0x1000000 storage    (12.25M, SPIFFS/FATFS for LVGL assets)
+nvs,      data, nvs,     ,        0x6000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        4M,
+storage,  data, spiffs,  ,        0xBF0000,
