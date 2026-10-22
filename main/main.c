@@ -16,6 +16,7 @@
 #include "lvgl.h"
 
 #include "ble_hid.h"
+#include "kb_keypad.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "https://hemukeji.taobao.com/";
@@ -91,8 +92,10 @@ void lvgl_task(void *pvParameter)
     esp_timer_handle_t lvgl_tick_timer = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
-    lv_demo_widgets();
-    //  lv_demo_music(); // music演示例程
+
+    /* 宏键盘界面（取代原来的 lv_demo_widgets 演示） */
+    kb_ui_create();
+
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(10)); /* Delay 1 tick (assumes FreeRTOS tick is 10ms */

@@ -398,10 +398,14 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
-#define LV_FONT_CUSTOM_DECLARE  LV_FONT_DECLARE(myfont)
+/* 项目自带的中英混排字体（main/lv_font_kb_16.c），
+ * 由 lv_font_conv 从黑体生成，只含界面实际用到的 26 个汉字 + ASCII，
+ * 文件约 56KB。内置的 SIMSUN_16_CJK 实际只覆盖日文假名，中文是缺字的，
+ * 因此这里改用自生成字体作为全局默认。 */
+#define LV_FONT_CUSTOM_DECLARE  LV_FONT_DECLARE(lv_font_kb_16)
 
 /*Always set a default font*/
-#define LV_FONT_DEFAULT &lv_font_montserrat_14
+#define LV_FONT_DEFAULT &lv_font_kb_16
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.
