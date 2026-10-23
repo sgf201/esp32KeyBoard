@@ -1,46 +1,37 @@
 /**
  * @file kb_keypad.c
  *
- * 虚拟键盘 + 触摸板界面实现。
+ * 虚拟键盘 + 触摸板，支持真正的多指同时按键。
  *
- * ============================ 布局 ============================
+ * ========================= 为什么自己做触摸 =========================
  *
- * 三种模式，底部栏常驻以便随时切换：
+ * LVGL v8 的输入设备是单点模型：lv_indev_data_t 里只有一个 lv_point_t。
+ * 即便 GT911 硬件能上报 5 个触点（gt911_read_points() 已实现），LVGL 的
+ * indev 回调也只能交出 points[0]，于是「两根手指按两个键」永远只有第一个
+ * 生效。
  *
- *   分屏 (SPLIT)          键盘在左 62%，触摸板在右 38%
- *   全键盘 (KEYBOARD)     键盘占满主区域，按键更大
- *   全触摸板 (TOUCHPAD)   触摸板占满主区域，附左右键按钮
+ * 为了让多指同时按键真正可用，这里不再把键盘交给 LVGL 的 indev，而是：
  *
- *   +-----------------------------------------------------------+
- *   | 状态条：连接状态 / 锁定中的修饰键                          | 36px
- *   +----------------------------+------------------------------+
- *   |                            |                              |
- *   |  主区域（按模式变化）                                       |
- *   |                            |                              |
- *   +----------------------------+------------------------------+
- *   | 分屏 | 全键盘 | 全触摸板                                    | 44px
- *   +-----------------------------------------------------------+
+ *   1. 独立任务轮询 gt911 的多点快照（gt911_get_last_sample，不抢 I2C ——
+ *      GT911 的状态寄存器是读后清零的，全局只能有一个读者）
+ *   2. 对每个触点做按键命中测试（自己按行列算矩形，不依赖 LVGL API）
+ *   3. 维护「当前按下的按键集合」
+ *   4. 集合变化时发送一次包含全部按键的 HID 报告（最多 6 键）
  *
- * ======================== 手势设计 ========================
+ * ========================= 线程模型（重要） =========================
  *
- * 「滑动即触摸」——整个屏幕都支持触摸板手势：
- *   - 手指按下后位移小于阈值就松手  -> 当作点击该按键
- *   - 位移超过阈值                  -> 转为拖动，只移动光标，不输入任何字符
+ * 有两条硬约束，违反了就会「按键发不出去」：
  *
- * 这正是手机输入法的做法：想按某个键直接点，想移动光标就在任意位置滑动。
- * 判定推迟到松手时才做，所以滑动过程中不会误触发按键。
+ *   A. 不能放在 esp_timer 回调里。ble_hid_key_tap() 内部有 vTaskDelay(12ms)，
+ *      在 esp_timer 回调中阻塞会卡死定时器服务（该回调运行在 esp_timer 任务
+ *      上下文，不允许阻塞）。因此触摸扫描放在独立的 FreeRTOS 任务里。
  *
- * ======================== 事件模型 ========================
+ *   B. LVGL 不是线程安全的。main.c 用 xGuiSemaphore 保护 lv_timer_handler()，
+ *      任何跨任务修改界面的操作都必须先拿这把锁。这里通过 kb_set_gui_lock()
+ *      注入锁句柄，刷新按钮状态时严格加锁。
  *
- * 这里有个容易踩的坑：按键矩阵上的事件会通过 LV_OBJ_FLAG_EVENT_BUBBLE
- * 冒泡到根 screen，而根 screen 上有手势回调。如果手势回调在 PRESSED 时
- * 清空「待发送按键」，就会把按钮刚记录下的按键抹掉，表现为按键全部失灵。
- *
- * 因此约定：
- *   - btnmatrix 的 PRESSED 只负责记录 s_pressed_btn
- *   - 根 screen 的手势回调在 PRESSED 时绝不碰 s_pressed_btn
- *   - 只有手势回调在 RELEASED 时，且在「未拖动」前提下才发送并清除
- *   - 一旦判定为拖动，立即作废 s_pressed_btn
+ * 另外，为了让「按住不放」也能稳定工作，HID 报告的发送与界面刷新解耦：
+ * 触摸任务只更新按键集合，发送交给它自己按需进行，界面刷新走 LVGL 定时器。
  */
 
 #include "kb_keypad.h"
@@ -49,14 +40,16 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "ble_hid.h"
+#include "gt911.h"
 
 static const char *TAG = "KB";
 
 /* ---------------------------------------------------------------------------
- * 尺寸与可调参数
+ * 尺寸与参数
  * ------------------------------------------------------------------------- */
 #define SCREEN_W            800
 #define SCREEN_H            480
@@ -64,22 +57,19 @@ static const char *TAG = "KB";
 #define STATUS_BAR_H        36
 #define MODE_BAR_H          44
 
-/* 分屏模式下键盘占左侧的百分比 */
 #define SPLIT_KB_PCT        62
 
-/* 触摸板灵敏度：手指每移动 1px，光标移动几个像素。
- * 全屏触摸板面积大，用低一点的增益更跟手。 */
-#define TOUCHPAD_GAIN_SPLIT 2
-#define TOUCHPAD_GAIN_FULL  2
-
-/* 位移阈值：超过这个累计距离就判定为拖动而非点击 */
-#define DRAG_THRESHOLD      16
-
-/* HID 鼠标报告单轴范围 */
+#define TOUCHPAD_GAIN       2
+#define TAP_MOVE_LIMIT      14
 #define HID_AXIS_MAX        127
+#define HID_MAX_KEYS        6
 
-/* 「无待发送按键」的哨兵值 */
-#define NO_BUTTON           0xFFFF
+/* 触摸扫描周期 */
+#define TOUCH_TASK_PERIOD_MS 15
+
+/* 任务栈与优先级 */
+#define TOUCH_TASK_STACK    (1024 * 4)
+#define TOUCH_TASK_PRIO     4
 
 /* ---------------------------------------------------------------------------
  * 按键表
@@ -100,7 +90,8 @@ static const char *TAG = "KB";
 #define KEY_SC_SAVE    (-24)
 #define KEY_SC_SELALL  (-25)
 
-/* 全键盘模式下复用同一张表，只是按键被拉大 */
+#define KB_ROWS        6
+
 static const char *kb_map[] = {
     /* 0 */ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
     /* 1 */ "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
@@ -119,13 +110,27 @@ static const int16_t kb_keys[] = {
     /* 5 */ KEY_SC_COPY, KEY_SC_PASTE, KEY_SC_CUT, KEY_SC_UNDO, KEY_SC_SAVE, KEY_SC_SELALL,
 };
 
-#define KB_KEY_COUNT (sizeof(kb_keys) / sizeof(kb_keys[0]))
+#define KB_KEY_COUNT ((int)(sizeof(kb_keys) / sizeof(kb_keys[0])))
+
+static const uint8_t kb_row_counts[KB_ROWS] = {10, 10, 9, 9, 6, 6};
+static const uint8_t kb_row_start[KB_ROWS]  = {0, 10, 20, 29, 38, 44};
 
 #define MOD_CTRL_BIT   BLE_HID_MOD_LCTRL
 #define MOD_SHIFT_BIT  BLE_HID_MOD_LSHIFT
 #define MOD_ALT_BIT    BLE_HID_MOD_LALT
 
+/* ---------------------------------------------------------------------------
+ * 共享状态
+ *
+ * s_pressed / s_modifiers 由触摸任务写、LVGL 定时器读，用 s_state_lock 保护。
+ * HID 发送只在触摸任务里做，避免两处并发操作 BLE。
+ * ------------------------------------------------------------------------- */
 static uint8_t s_modifiers = 0;
+static bool    s_key_down[KB_KEY_COUNT];
+
+static SemaphoreHandle_t s_state_lock = NULL;   /* 保护上面的按键状态 */
+static SemaphoreHandle_t s_gui_lock = NULL;     /* 注入自 main.c 的 LVGL 锁 */
+static volatile bool     s_visual_dirty = false;
 
 /* ---------------------------------------------------------------------------
  * UI 对象
@@ -135,72 +140,110 @@ static lv_obj_t *s_kb_container = NULL;
 static lv_obj_t *s_btnmatrix    = NULL;
 static lv_obj_t *s_touchpad     = NULL;
 static lv_obj_t *s_tp_hint      = NULL;
-static lv_obj_t *s_click_row    = NULL;   /* 全屏触摸板模式下的左/右键 */
+static lv_obj_t *s_click_row    = NULL;
 static lv_obj_t *s_mode_btnm    = NULL;
 
 static kb_mode_t s_mode = KB_MODE_SPLIT;
 
 /* ---------------------------------------------------------------------------
- * 手势状态
+ * 键盘区几何
  * ------------------------------------------------------------------------- */
-typedef struct {
-    bool       active;      /* 手指是否按下 */
-    bool       dragging;    /* 是否已判定为拖动 */
-    lv_point_t origin;      /* 按下点 */
-    lv_point_t last;        /* 上次采样点 */
-    int        accum;       /* 累计位移 */
-} gesture_t;
+typedef struct { int x, y, w, h; } rect_t;
+static rect_t s_kb_rect = {0, 0, 0, 0};
 
-static gesture_t s_g;
+static bool rect_contains(const rect_t *r, int px, int py)
+{
+    return px >= r->x && px < r->x + r->w &&
+           py >= r->y && py < r->y + r->h;
+}
 
-/* 由 btnmatrix 的 PRESSED 写入，由手势回调在松手时消费。
- * 声明为 volatile 是因为它跨越两个回调，且语义上代表「硬件事件」。 */
-static volatile uint16_t s_pressed_btn = NO_BUTTON;
+static int hit_test_key(int px, int py)
+{
+    if (!rect_contains(&s_kb_rect, px, py)) {
+        return -1;
+    }
+    int rel_x = px - s_kb_rect.x;
+    int rel_y = py - s_kb_rect.y;
+
+    int row_h = s_kb_rect.h / KB_ROWS;
+    if (row_h <= 0) {
+        return -1;
+    }
+    int row = rel_y / row_h;
+    if (row < 0 || row >= KB_ROWS) {
+        return -1;
+    }
+    int cols = kb_row_counts[row];
+    int col_w = s_kb_rect.w / cols;
+    if (col_w <= 0) {
+        return -1;
+    }
+    int col = rel_x / col_w;
+    if (col < 0 || col >= cols) {
+        return -1;
+    }
+    int idx = kb_row_start[row] + col;
+    return (idx >= 0 && idx < KB_KEY_COUNT) ? idx : -1;
+}
+
+static bool point_in_touchpad(int px, int py)
+{
+    if (s_touchpad == NULL || lv_obj_has_flag(s_touchpad, LV_OBJ_FLAG_HIDDEN)) {
+        return false;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(s_touchpad, &a);
+    return px >= a.x1 && px <= a.x2 && py >= a.y1 && py <= a.y2;
+}
 
 /* ---------------------------------------------------------------------------
- * 修饰键高亮
+ * HID 发送
  * ------------------------------------------------------------------------- */
-static void refresh_modifier_highlight(void)
+static uint8_t s_hid_keys[HID_MAX_KEYS];
+static int     s_hid_key_count = 0;
+static uint8_t s_last_hid_keys[HID_MAX_KEYS];
+static int     s_last_hid_count = 0;
+
+/* 收集当前按下的普通键并发送。调用者需持有 s_state_lock。 */
+static void flush_keys_locked(void)
 {
-    if (s_btnmatrix == NULL) {
+    s_hid_key_count = 0;
+    memset(s_hid_keys, 0, sizeof(s_hid_keys));
+
+    for (int i = 0; i < KB_KEY_COUNT && s_hid_key_count < HID_MAX_KEYS; i++) {
+        if (s_key_down[i] && kb_keys[i] > 0) {
+            s_hid_keys[s_hid_key_count++] = (uint8_t)kb_keys[i];
+        }
+    }
+
+    if (s_hid_key_count == s_last_hid_count &&
+        memcmp(s_hid_keys, s_last_hid_keys, sizeof(s_hid_keys)) == 0) {
+        return;   /* 集合没变，不重复发 */
+    }
+
+    memcpy(s_last_hid_keys, s_hid_keys, sizeof(s_hid_keys));
+    s_last_hid_count = s_hid_key_count;
+
+    if (!ble_hid_is_connected()) {
         return;
     }
-    for (uint16_t i = 0; i < KB_KEY_COUNT; i++) {
-        uint8_t bit = 0;
-        switch (kb_keys[i]) {
-        case KEY_MOD_CTRL:  bit = MOD_CTRL_BIT;  break;
-        case KEY_MOD_SHIFT: bit = MOD_SHIFT_BIT; break;
-        case KEY_MOD_ALT:   bit = MOD_ALT_BIT;   break;
-        default: continue;
-        }
-        if (s_modifiers & bit) {
-            lv_btnmatrix_set_btn_ctrl(s_btnmatrix, i, LV_BTNMATRIX_CTRL_CHECKED);
-        } else {
-            lv_btnmatrix_clear_btn_ctrl(s_btnmatrix, i, LV_BTNMATRIX_CTRL_CHECKED);
-        }
-    }
-}
 
-static void toggle_modifier(uint8_t bit)
-{
-    if (s_modifiers & bit) {
-        s_modifiers &= ~bit;
+    if (s_hid_key_count == 0) {
+        ble_hid_key_release_all();
     } else {
-        s_modifiers |= bit;
+        ble_hid_key_down(s_modifiers, s_hid_keys);
+        if (s_hid_key_count > 1) {
+            ESP_LOGI(TAG, "multi-key: %d keys down", s_hid_key_count);
+        }
     }
-    ESP_LOGI(TAG, "modifiers -> 0x%02x", s_modifiers);
-    refresh_modifier_highlight();
 }
 
-/* ---------------------------------------------------------------------------
- * 发送按键
- * ------------------------------------------------------------------------- */
-static void send_key_value(int16_t key)
+static void trigger_special_key(int16_t key)
 {
     switch (key) {
-    case KEY_MOD_CTRL:   toggle_modifier(MOD_CTRL_BIT);  return;
-    case KEY_MOD_SHIFT:  toggle_modifier(MOD_SHIFT_BIT); return;
-    case KEY_MOD_ALT:    toggle_modifier(MOD_ALT_BIT);   return;
+    case KEY_MOD_CTRL:   s_modifiers ^= MOD_CTRL_BIT;  break;
+    case KEY_MOD_SHIFT:  s_modifiers ^= MOD_SHIFT_BIT; break;
+    case KEY_MOD_ALT:    s_modifiers ^= MOD_ALT_BIT;   break;
 
     case KEY_BACKSPACE:  ble_hid_key_tap(0x2A, s_modifiers); break;
     case KEY_ENTER:      ble_hid_key_tap(0x28, s_modifiers); break;
@@ -208,162 +251,333 @@ static void send_key_value(int16_t key)
     case KEY_SPACE:      ble_hid_key_tap(0x2C, s_modifiers); break;
     case KEY_ESC:        ble_hid_key_tap(0x29, s_modifiers); break;
 
-    case KEY_SC_COPY:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_C); return;
-    case KEY_SC_PASTE:   ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_V); return;
-    case KEY_SC_CUT:     ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_X); return;
-    case KEY_SC_UNDO:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_Z); return;
-    case KEY_SC_SAVE:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_S); return;
-    case KEY_SC_SELALL:  ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_A); return;
+    case KEY_SC_COPY:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_C); break;
+    case KEY_SC_PASTE:   ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_V); break;
+    case KEY_SC_CUT:     ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_X); break;
+    case KEY_SC_UNDO:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_Z); break;
+    case KEY_SC_SAVE:    ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_S); break;
+    case KEY_SC_SELALL:  ble_hid_key_combo(BLE_HID_MOD_LCTRL, BLE_HID_KEY_A); break;
 
-    default:
+    default: break;
+    }
+    s_visual_dirty = true;
+}
+
+/* ---------------------------------------------------------------------------
+ * 触点跟踪
+ * ------------------------------------------------------------------------- */
+#define MAX_TRACKED  GT911_MAX_TOUCH_POINTS
+
+typedef struct {
+    bool       used;
+    uint8_t    track_id;
+    int        key_idx;
+    bool       on_touchpad;
+    lv_point_t last;
+    int        moved;
+} track_t;
+
+static track_t s_tracks[MAX_TRACKED];
+
+static void release_track(track_t *t)
+{
+    if (t == NULL || !t->used) {
+        return;
+    }
+
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    if (t->key_idx >= 0 && t->key_idx < KB_KEY_COUNT) {
+        int16_t key = kb_keys[t->key_idx];
+        s_key_down[t->key_idx] = false;
         if (key > 0) {
-            ble_hid_key_tap((uint8_t)key, s_modifiers);
+            flush_keys_locked();
         }
-        return;
     }
+    xSemaphoreGive(s_state_lock);
+
+    /* 触摸板轻点 -> 左键单击（不阻塞，send_mouse 内部无 delay） */
+    if (t->on_touchpad && t->moved < TAP_MOVE_LIMIT) {
+        ble_hid_mouse_click(BLE_HID_MOUSE_LEFT);
+    }
+
+    t->used = false;
+    t->key_idx = -1;
+    t->on_touchpad = false;
+    s_visual_dirty = true;
 }
 
 /* ---------------------------------------------------------------------------
- * 光标移动
+ * 触摸扫描任务
  * ------------------------------------------------------------------------- */
-static void move_cursor(int dx, int dy, int gain)
+static void touch_task(void *arg)
 {
-    int mx = dx * gain;
-    int my = dy * gain;
+    (void)arg;
+    ESP_LOGI(TAG, "touch task started, period %d ms", TOUCH_TASK_PERIOD_MS);
 
-    while (mx != 0 || my != 0) {
-        int sx = mx > HID_AXIS_MAX ? HID_AXIS_MAX : (mx < -HID_AXIS_MAX ? -HID_AXIS_MAX : mx);
-        int sy = my > HID_AXIS_MAX ? HID_AXIS_MAX : (my < -HID_AXIS_MAX ? -HID_AXIS_MAX : my);
-        ble_hid_mouse_move((int8_t)sx, (int8_t)sy, 0);
-        mx -= sx;
-        my -= sy;
+    /* 等 gt911_init() 完成（它由 lvgl_driver_init 调用，可能稍晚） */
+    while (!gt911_status.inited) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    /* 注意：不要在这里 dump 寄存器。
+     * GT911 的状态寄存器读一次就会被主机清掉，dump 会把本次触摸事件偷走，
+     * 导致主循环永远读到 0x00。诊断只在需要时手工调用。 */
+
+    uint32_t last_diag = 0;
+    int sample_ok = 0, sample_err = 0;
+    int touch_seen = 0;
+    int idle_rounds = 0;
+    bool soft_reset_tried = false;
+
+    for (;;) {
+        gt911_touch_data_t td;
+
+        /* 主动采样：本任务是 GT911 的唯一读取者（LVGL 的 indev 未注册），
+         * 所以必须用 gt911_sample_now()，而不是读缓存快照。 */
+        esp_err_t sret = gt911_sample_now(&td);
+        if (sret == ESP_OK) {
+            sample_ok++;
+            if (td.count > 0) {
+                touch_seen++;
+                idle_rounds = 0;
+            } else {
+                idle_rounds++;
+            }
+
+            /* 周期诊断：每 3 秒打一次，同时带上原始状态寄存器。
+             * raw=0x00 说明控制器没检测到任何触摸；
+             * raw 的 bit7 为 1、低 4 位为 N 说明有 N 个触点。
+             * 这一步能把「硬件没上报」和「软件没读到」区分开。 */
+            uint32_t now = xTaskGetTickCount() / configTICK_RATE_HZ;
+            if (now != last_diag && (now % 3) == 0) {
+                last_diag = now;
+                uint8_t raw = gt911_debug_status();
+                ESP_LOGI(TAG, "diag: ok=%d err=%d touches=%d raw=0x%02X count=%u kb(%d,%d %dx%d)",
+                         sample_ok, sample_err, touch_seen,
+                         raw, (unsigned)td.count,
+                         s_kb_rect.x, s_kb_rect.y, s_kb_rect.w, s_kb_rect.h);
+
+                /* 若 buffer-ready 已置位但解析不出触点，打印原始数据区，
+                 * 判断是「坐标区真的有数据」还是「芯片只是置了个标志」。 */
+                if ((raw & 0x80) && td.count == 0 && touch_seen == 0) {
+                    gt911_debug_raw_points();
+                }
+            }
+        } else {
+            sample_err++;
+            if ((sample_err % 100) == 1) {
+                ESP_LOGW(TAG, "sample failed: %s (errs=%d)",
+                         esp_err_to_name(sret), sample_err);
+            }
+        }
+
+        if (sret == ESP_OK && td.count > 0) {
+            bool seen[MAX_TRACKED] = {0};
+
+            for (uint8_t i = 0; i < td.count; i++) {
+                uint8_t id = td.points[i].track_id;
+                int px = td.points[i].x;
+                int py = td.points[i].y;
+
+                /* 找到或新建该触点的跟踪记录 */
+                track_t *t = NULL;
+                int slot = -1;
+                for (int k = 0; k < MAX_TRACKED; k++) {
+                    if (s_tracks[k].used && s_tracks[k].track_id == id) {
+                        t = &s_tracks[k];
+                        slot = k;
+                        break;
+                    }
+                }
+                if (t == NULL) {
+                    for (int k = 0; k < MAX_TRACKED; k++) {
+                        if (!s_tracks[k].used) {
+                            memset(&s_tracks[k], 0, sizeof(track_t));
+                            s_tracks[k].used = true;
+                            s_tracks[k].track_id = id;
+                            s_tracks[k].key_idx = -1;
+                            s_tracks[k].last.x = px;
+                            s_tracks[k].last.y = py;
+                            t = &s_tracks[k];
+                            slot = k;
+                            break;
+                        }
+                    }
+                }
+                if (t == NULL) {
+                    continue;
+                }
+                seen[slot] = true;
+
+                bool fresh = (t->moved == 0 && t->key_idx == -1 && !t->on_touchpad);
+
+                /* 新触点：判定落点 */
+                if (fresh) {
+                    int idx = hit_test_key(px, py);
+                    if (idx >= 0) {
+                        t->key_idx = idx;
+                        int16_t key = kb_keys[idx];
+
+                        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+                        s_key_down[idx] = true;
+                        if (key > 0) {
+                            flush_keys_locked();
+                        }
+                        xSemaphoreGive(s_state_lock);
+
+                        if (key < 0) {
+                            /* 特殊键按下即触发，注意这里可能阻塞 12ms，
+                             * 本函数运行在任务上下文，安全。 */
+                            trigger_special_key(key);
+                        }
+                        s_visual_dirty = true;
+                    } else if (point_in_touchpad(px, py)) {
+                        t->on_touchpad = true;
+                    }
+                }
+
+                /* 移动 */
+                int dx = px - t->last.x;
+                int dy = py - t->last.y;
+                if (dx != 0 || dy != 0) {
+                    t->moved += (dx > 0 ? dx : -dx) + (dy > 0 ? dy : -dy);
+                    if (t->on_touchpad) {
+                        int mx = dx * TOUCHPAD_GAIN;
+                        int my = dy * TOUCHPAD_GAIN;
+                        while (mx != 0 || my != 0) {
+                            int sx = mx > HID_AXIS_MAX ? HID_AXIS_MAX : (mx < -HID_AXIS_MAX ? -HID_AXIS_MAX : mx);
+                            int sy = my > HID_AXIS_MAX ? HID_AXIS_MAX : (my < -HID_AXIS_MAX ? -HID_AXIS_MAX : my);
+                            ble_hid_mouse_move((int8_t)sx, (int8_t)sy, 0);
+                            mx -= sx;
+                            my -= sy;
+                        }
+                        s_visual_dirty = true;
+                    }
+                    t->last.x = px;
+                    t->last.y = py;
+                }
+            }
+
+            /* 未出现的触点视为抬起 */
+            for (int k = 0; k < MAX_TRACKED; k++) {
+                if (s_tracks[k].used && !seen[k]) {
+                    release_track(&s_tracks[k]);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(TOUCH_TASK_PERIOD_MS));
     }
 }
 
-static int current_gain(void)
-{
-    return (s_mode == KB_MODE_SPLIT) ? TOUCHPAD_GAIN_SPLIT : TOUCHPAD_GAIN_FULL;
-}
-
 /* ---------------------------------------------------------------------------
- * 根 screen 上的统一手势处理
+ * 界面刷新（LVGL 上下文，由 lv_timer 驱动）
  *
- * 注意：这个回调会收到两类事件——直接按在空白处的，以及从按键矩阵冒泡上来的。
- * 它必须能同时正确处理两者，且绝不能抹掉 btnmatrix 记录下的 s_pressed_btn。
+ * 只在这里改 LVGL 对象，且必须持有 GUI 锁，避免与 main.c 的 lv_timer_handler
+ * 并发。
  * ------------------------------------------------------------------------- */
-static void gesture_event_cb(lv_event_t *e)
+static void visual_refresh_cb(lv_timer_t *t)
 {
-    lv_event_code_t code = lv_event_get_code(e);
-
-    lv_indev_t *indev = lv_indev_get_act();
-    if (indev != NULL && lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+    (void)t;
+    if (s_btnmatrix == NULL) {
         return;
     }
 
-    lv_point_t p = {0, 0};
-    if (indev != NULL) {
-        lv_indev_get_point(indev, &p);
-    }
+    /* 取快照，缩短持锁时间 */
+    bool down[KB_KEY_COUNT];
+    uint8_t mods;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    memcpy(down, s_key_down, sizeof(down));
+    mods = s_modifiers;
+    xSemaphoreGive(s_state_lock);
 
-    switch (code) {
-    case LV_EVENT_PRESSED:
-        /* 只重置手势几何状态，绝不碰 s_pressed_btn：
-         * 该字段可能刚被 btnmatrix 的 PRESSED 写入。 */
-        s_g.active = true;
-        s_g.dragging = false;
-        s_g.accum = 0;
-        s_g.origin = p;
-        s_g.last = p;
-        break;
-
-    case LV_EVENT_PRESSING: {
-        if (!s_g.active) {
-            break;
-        }
-        int dx = p.x - s_g.last.x;
-        int dy = p.y - s_g.last.y;
-        if (dx == 0 && dy == 0) {
-            break;
-        }
-        s_g.accum += (dx > 0 ? dx : -dx) + (dy > 0 ? dy : -dy);
-
-        if (!s_g.dragging && s_g.accum > DRAG_THRESHOLD) {
-            s_g.dragging = true;
-            /* 一旦开始拖动，这一下就不再是点击：作废待发按键 */
-            s_pressed_btn = NO_BUTTON;
-            if (s_tp_hint) {
-                lv_obj_add_flag(s_tp_hint, LV_OBJ_FLAG_HIDDEN);
-            }
-            ESP_LOGD(TAG, "drag start");
-        }
-
-        if (s_g.dragging) {
-            move_cursor(dx, dy, current_gain());
-            s_g.last = p;
-        }
-        break;
-    }
-
-    case LV_EVENT_RELEASED:
-    case LV_EVENT_PRESS_LOST: {
-        uint16_t btn = s_pressed_btn;
-        bool was_drag = s_g.dragging;
-        s_g.active = false;
-        s_g.dragging = false;
-        s_pressed_btn = NO_BUTTON;
-
-        if (code == LV_EVENT_RELEASED && !was_drag && btn != NO_BUTTON &&
-            btn < KB_KEY_COUNT) {
-            /* 位移很小 -> 真正的点击，这时才发按键 */
-            send_key_value(kb_keys[btn]);
-        }
-
-        /* 清理按钮的按下态显示 */
-        if (s_btnmatrix && btn != NO_BUTTON && btn < KB_KEY_COUNT) {
-            if (lv_btnmatrix_get_selected_btn(s_btnmatrix) == btn) {
-                lv_btnmatrix_clear_btn_ctrl(s_btnmatrix, btn,
-                                            LV_BTNMATRIX_CTRL_CHECKED);
+    for (int i = 0; i < KB_KEY_COUNT; i++) {
+        bool show = down[i];
+        if (!show) {
+            switch (kb_keys[i]) {
+            case KEY_MOD_CTRL:  show = (mods & MOD_CTRL_BIT) != 0;  break;
+            case KEY_MOD_SHIFT: show = (mods & MOD_SHIFT_BIT) != 0; break;
+            case KEY_MOD_ALT:   show = (mods & MOD_ALT_BIT) != 0;   break;
+            default: break;
             }
         }
-        refresh_modifier_highlight();
-        break;
-    }
-
-    default:
-        break;
+        if (show) {
+            lv_btnmatrix_set_btn_ctrl(s_btnmatrix, i, LV_BTNMATRIX_CTRL_CHECKED);
+        } else {
+            lv_btnmatrix_clear_btn_ctrl(s_btnmatrix, i, LV_BTNMATRIX_CTRL_CHECKED);
+        }
     }
 }
 
-/* ---------------------------------------------------------------------------
- * 键盘按钮：只记录，不发送
- * ------------------------------------------------------------------------- */
-static void btnmatrix_event_cb(lv_event_t *e)
+static void status_timer_cb(lv_timer_t *t)
 {
-    if (lv_event_get_code(e) != LV_EVENT_PRESSED) {
+    (void)t;
+    if (s_status_label == NULL) {
         return;
     }
-    lv_obj_t *btnm = lv_event_get_target(e);
-    uint32_t id = lv_btnmatrix_get_selected_btn(btnm);
-    if (id != LV_BTNMATRIX_BTN_NONE && id < KB_KEY_COUNT) {
-        s_pressed_btn = (uint16_t)id;
-    }
-}
 
-/* ---------------------------------------------------------------------------
- * 触摸板左右键（仅全屏触摸板模式显示）
- * ------------------------------------------------------------------------- */
-static void click_btn_event_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
-        return;
+    int n = 0;
+    uint8_t mods;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    for (int i = 0; i < KB_KEY_COUNT; i++) {
+        if (s_key_down[i]) {
+            n++;
+        }
     }
-    intptr_t which = (intptr_t)lv_event_get_user_data(e);
-    ble_hid_mouse_click(which == 0 ? BLE_HID_MOUSE_LEFT : BLE_HID_MOUSE_RIGHT);
+    mods = s_modifiers;
+    xSemaphoreGive(s_state_lock);
+
+    const char *conn = ble_hid_is_connected() ? "已连接" : "待连接";
+    char buf[128];
+    lv_snprintf(buf, sizeof(buf), "ESP32 宏键盘  %s", conn);
+
+    if (n > 1) {
+        size_t len = strlen(buf);
+        lv_snprintf(buf + len, sizeof(buf) - len, "  按下%d键", n);
+    }
+
+    if (mods) {
+        size_t len = strlen(buf);
+        lv_snprintf(buf + len, sizeof(buf) - len, "  [");
+        if (mods & MOD_CTRL_BIT) {
+            len = strlen(buf);
+            lv_snprintf(buf + len, sizeof(buf) - len, "CTRL ");
+        }
+        if (mods & MOD_SHIFT_BIT) {
+            len = strlen(buf);
+            lv_snprintf(buf + len, sizeof(buf) - len, "SHIFT ");
+        }
+        if (mods & MOD_ALT_BIT) {
+            len = strlen(buf);
+            lv_snprintf(buf + len, sizeof(buf) - len, "ALT ");
+        }
+        len = strlen(buf);
+        if (len > 0 && buf[len - 1] == ' ') {
+            buf[len - 1] = ']';
+        }
+    }
+
+    lv_label_set_text(s_status_label, buf);
 }
 
 /* ---------------------------------------------------------------------------
  * 模式切换
  * ------------------------------------------------------------------------- */
+static void update_kb_rect(void)
+{
+    if (s_kb_container == NULL ||
+        lv_obj_has_flag(s_kb_container, LV_OBJ_FLAG_HIDDEN)) {
+        memset(&s_kb_rect, 0, sizeof(s_kb_rect));
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(s_kb_container, &a);
+    s_kb_rect.x = a.x1 + 3;
+    s_kb_rect.y = a.y1 + 3;
+    s_kb_rect.w = (a.x2 - a.x1 + 1) - 6;
+    s_kb_rect.h = (a.y2 - a.y1 + 1) - 6;
+}
+
 static void apply_mode(kb_mode_t mode)
 {
     s_mode = mode;
@@ -373,7 +587,6 @@ static void apply_mode(kb_mode_t mode)
 
     switch (mode) {
     case KB_MODE_KEYBOARD:
-        /* 全键盘：键盘占满主区域，按键自然变大 */
         lv_obj_add_flag(s_touchpad, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_click_row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_kb_container, LV_OBJ_FLAG_HIDDEN);
@@ -382,15 +595,12 @@ static void apply_mode(kb_mode_t mode)
         break;
 
     case KB_MODE_TOUCHPAD: {
-        /* 全触摸板：触摸板占满主区域，底部留一条放左右键 */
         lv_coord_t click_h = 54;
         lv_obj_add_flag(s_kb_container, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_touchpad, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_click_row, LV_OBJ_FLAG_HIDDEN);
-
         lv_obj_set_pos(s_touchpad, 0, main_y);
         lv_obj_set_size(s_touchpad, SCREEN_W, main_h - click_h);
-
         lv_obj_set_pos(s_click_row, 0, main_y + main_h - click_h);
         lv_obj_set_size(s_click_row, SCREEN_W, click_h);
         break;
@@ -398,7 +608,6 @@ static void apply_mode(kb_mode_t mode)
 
     case KB_MODE_SPLIT:
     default: {
-        /* 分屏：左右分栏 */
         lv_coord_t kb_w = (SCREEN_W * SPLIT_KB_PCT) / 100;
         lv_coord_t tp_w = SCREEN_W - kb_w;
 
@@ -408,14 +617,12 @@ static void apply_mode(kb_mode_t mode)
 
         lv_obj_set_pos(s_kb_container, 0, main_y);
         lv_obj_set_size(s_kb_container, kb_w, main_h);
-
         lv_obj_set_pos(s_touchpad, kb_w, main_y);
         lv_obj_set_size(s_touchpad, tp_w, main_h);
         break;
     }
     }
 
-    /* 触摸板提示文字只在分屏模式给出来（全屏模式空间充足，不需要提示） */
     if (s_tp_hint) {
         if (mode == KB_MODE_SPLIT) {
             lv_obj_clear_flag(s_tp_hint, LV_OBJ_FLAG_HIDDEN);
@@ -434,7 +641,12 @@ static void apply_mode(kb_mode_t mode)
         }
     }
 
-    ESP_LOGI(TAG, "mode -> %d", (int)mode);
+    /* 布局变了，重算命中区域 */
+    lv_obj_update_layout(lv_scr_act());
+    update_kb_rect();
+
+    ESP_LOGI(TAG, "mode -> %d (kb %d,%d %dx%d)", (int)mode,
+             s_kb_rect.x, s_kb_rect.y, s_kb_rect.w, s_kb_rect.h);
 }
 
 void kb_ui_set_mode(kb_mode_t mode)
@@ -450,6 +662,9 @@ kb_mode_t kb_ui_get_mode(void)
     return s_mode;
 }
 
+/* ---------------------------------------------------------------------------
+ * 模式栏与左右键（LVGL 常规点击，不参与多点判断）
+ * ------------------------------------------------------------------------- */
 static void mode_bar_event_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
@@ -463,56 +678,31 @@ static void mode_bar_event_cb(lv_event_t *e)
     kb_ui_set_mode((kb_mode_t)id);
 }
 
-/* ---------------------------------------------------------------------------
- * 状态栏
- * ------------------------------------------------------------------------- */
-static void status_timer_cb(lv_timer_t *t)
+static void click_btn_event_cb(lv_event_t *e)
 {
-    (void)t;
-    if (s_status_label == NULL) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
         return;
     }
-
-    const char *conn = ble_hid_is_connected() ? "已连接" : "待连接";
-    char buf[96];
-    lv_snprintf(buf, sizeof(buf), "ESP32 宏键盘  %s", conn);
-
-    if (s_modifiers) {
-        size_t n = strlen(buf);
-        lv_snprintf(buf + n, sizeof(buf) - n, "  [");
-        if (s_modifiers & MOD_CTRL_BIT) {
-            n = strlen(buf);
-            lv_snprintf(buf + n, sizeof(buf) - n, "CTRL ");
-        }
-        if (s_modifiers & MOD_SHIFT_BIT) {
-            n = strlen(buf);
-            lv_snprintf(buf + n, sizeof(buf) - n, "SHIFT ");
-        }
-        if (s_modifiers & MOD_ALT_BIT) {
-            n = strlen(buf);
-            lv_snprintf(buf + n, sizeof(buf) - n, "ALT ");
-        }
-        n = strlen(buf);
-        if (n > 0 && buf[n - 1] == ' ') {
-            buf[n - 1] = ']';
-        }
-    }
-
-    lv_label_set_text(s_status_label, buf);
+    intptr_t which = (intptr_t)lv_event_get_user_data(e);
+    ble_hid_mouse_click(which == 0 ? BLE_HID_MOUSE_LEFT : BLE_HID_MOUSE_RIGHT);
 }
 
 /* ---------------------------------------------------------------------------
  * 界面构建
  * ------------------------------------------------------------------------- */
+void kb_ui_set_gui_lock(SemaphoreHandle_t lock)
+{
+    s_gui_lock = lock;
+}
+
 void kb_ui_create(void)
 {
+    s_state_lock = xSemaphoreCreateMutex();
+    configASSERT(s_state_lock != NULL);
+
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 根 screen 承接统一手势 */
-    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr, gesture_event_cb, LV_EVENT_ALL, NULL);
 
     /* ---- 状态栏 ---- */
     lv_obj_t *bar = lv_obj_create(scr);
@@ -529,7 +719,7 @@ void kb_ui_create(void)
     lv_label_set_text(s_status_label, "ESP32 宏键盘  待连接");
     lv_obj_align(s_status_label, LV_ALIGN_LEFT_MID, 4, 0);
 
-    lv_timer_create(status_timer_cb, 500, NULL);
+    lv_timer_create(status_timer_cb, 300, NULL);
 
     /* ---- 键盘 ---- */
     s_kb_container = lv_obj_create(scr);
@@ -538,7 +728,6 @@ void kb_ui_create(void)
     lv_obj_set_style_pad_all(s_kb_container, 3, 0);
     lv_obj_set_style_radius(s_kb_container, 0, 0);
     lv_obj_clear_flag(s_kb_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_kb_container, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     s_btnmatrix = lv_btnmatrix_create(s_kb_container);
     lv_btnmatrix_set_map(s_btnmatrix, kb_map);
@@ -555,18 +744,15 @@ void kb_ui_create(void)
                               LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_text_color(s_btnmatrix, lv_color_white(),
                                 LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(s_btnmatrix, lv_color_hex(0x1ABC9C),
-                              LV_PART_ITEMS | LV_STATE_PRESSED);
 
-    for (uint16_t i = 0; i < KB_KEY_COUNT; i++) {
+    for (int i = 0; i < KB_KEY_COUNT; i++) {
         if (kb_keys[i] == KEY_MOD_CTRL || kb_keys[i] == KEY_MOD_SHIFT ||
             kb_keys[i] == KEY_MOD_ALT) {
             lv_btnmatrix_set_btn_ctrl(s_btnmatrix, i, LV_BTNMATRIX_CTRL_CHECKABLE);
         }
     }
-    lv_obj_add_event_cb(s_btnmatrix, btnmatrix_event_cb, LV_EVENT_ALL, NULL);
 
-    /* ---- 触摸板 ---- */
+    /* ---- 触摸板（纯视觉，手势由 touch_task 处理） ---- */
     s_touchpad = lv_obj_create(scr);
     lv_obj_set_style_bg_color(s_touchpad, lv_color_hex(0x18222C), 0);
     lv_obj_set_style_border_color(s_touchpad, lv_color_hex(0x2E86C1), 0);
@@ -574,7 +760,6 @@ void kb_ui_create(void)
     lv_obj_set_style_radius(s_touchpad, 6, 0);
     lv_obj_set_style_pad_all(s_touchpad, 4, 0);
     lv_obj_clear_flag(s_touchpad, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_touchpad, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     s_tp_hint = lv_label_create(s_touchpad);
     lv_label_set_text(s_tp_hint, "触摸板\n拖动移动光标\n轻点=左键");
@@ -582,12 +767,11 @@ void kb_ui_create(void)
     lv_obj_set_style_text_align(s_tp_hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(s_tp_hint);
 
-    /* ---- 全屏触摸板模式下的左/右键 ---- */
+    /* ---- 左/右键 ---- */
     s_click_row = lv_obj_create(scr);
     lv_obj_set_style_bg_opa(s_click_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_click_row, 0, 0);
     lv_obj_set_style_pad_all(s_click_row, 3, 0);
-    lv_obj_set_style_pad_column(s_click_row, 8, 0);
     lv_obj_set_flex_flow(s_click_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_click_row, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -608,7 +792,7 @@ void kb_ui_create(void)
         lv_obj_center(lbl);
     }
 
-    /* ---- 底部模式栏 ---- */
+    /* ---- 模式栏 ---- */
     lv_obj_t *mode_bar = lv_obj_create(scr);
     lv_obj_set_size(mode_bar, SCREEN_W, MODE_BAR_H);
     lv_obj_set_pos(mode_bar, 0, SCREEN_H - MODE_BAR_H);
@@ -635,5 +819,12 @@ void kb_ui_create(void)
 
     apply_mode(KB_MODE_SPLIT);
 
-    ESP_LOGI(TAG, "keypad UI created (%u keys)", (unsigned)KB_KEY_COUNT);
+    /* 视觉刷新定时器（运行在 LVGL 上下文） */
+    lv_timer_create(visual_refresh_cb, 50, NULL);
+
+    /* 触摸扫描任务：独立任务，可安全阻塞 */
+    xTaskCreatePinnedToCore(touch_task, "kb_touch", TOUCH_TASK_STACK,
+                            NULL, TOUCH_TASK_PRIO, NULL, 0);
+
+    ESP_LOGI(TAG, "keypad UI created (%d keys, multi-touch enabled)", KB_KEY_COUNT);
 }

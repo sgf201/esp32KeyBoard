@@ -125,14 +125,60 @@ esp_err_t gt911_read_points(gt911_touch_data_t *out);
   * @brief  Copy the most recent touch sample without touching the I2C bus.
   *
   * The GT911 status register is read-to-clear, so only one consumer may poll
-  * the controller (in this project that is the LVGL input driver). Any other
-  * task that wants to observe touch state should call this instead, which just
-  * snapshots the last sample gt911_read_points() produced.
+  * the controller. Any observer that must not disturb sampling should call this,
+  * which just snapshots whatever gt911_read_points()/gt911_sample_now() produced.
   *
   * @param  out: receives a copy of the last sample.
   * @retval true if a sample has been recorded at least once.
   */
 bool gt911_get_last_sample(gt911_touch_data_t *out);
+
+/**
+  * @brief  Sample the controller now and return the result (recommended API).
+  *
+  * Serialises the whole I2C transaction with an internal mutex, so a single task
+  * can safely be the only reader. When the LVGL indev is not registered (this
+  * project skips it to gain real multi-touch), nothing else ever calls
+  * gt911_read_points(), so this function MUST be used or the snapshot stays
+  * empty and touch appears dead.
+  *
+  * @param  out: receives this sample.
+  * @retval ESP_OK on success, otherwise a timeout or I2C error.
+  */
+esp_err_t gt911_sample_now(gt911_touch_data_t *out);
+
+/**
+  * @brief  Create the I2C access mutex (optional; gt911_sample_now does it).
+  */
+void gt911_i2c_lock_init(void);
+
+/**
+  * @brief  Read the raw status register (0x814E) for diagnostics.
+  *
+  * @retval status byte; 0xFF if not initialised, 0xFE if the I2C read failed.
+  */
+uint8_t gt911_debug_status(void);
+
+/**
+  * @brief  Dump a handful of key registers to the log (diagnostics).
+  */
+void gt911_debug_dump(void);
+
+/**
+  * @brief  Dump the raw 44-byte touch buffer starting at the status register.
+  *
+  * Consumes one touch event (the status read acknowledges it), so call this only
+  * while diagnosing a "chip answers I2C but never reports points" problem.
+  */
+void gt911_debug_raw_points(void);
+
+/**
+  * @brief  Software-reset the controller and wait for it to settle.
+  *
+  * Useful when the chip answers I2C but reports no touch events at all
+  * (status register stuck at 0x00).
+  */
+esp_err_t gt911_soft_reset(void);
 
 /**
   * @brief  Initialize for GT911 communication via I2C

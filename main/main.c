@@ -78,6 +78,12 @@ void lvgl_task(void *pvParameter)
     lv_disp_drv_register(&disp_drv);
 
 #if CONFIG_LV_TOUCH_CONTROLLER != TOUCH_CONTROLLER_NONE
+    /* 触摸的采样全部由 kb_keypad 的触摸任务负责（gt911_sample_now）。
+     *
+     * 这里注册一个只读快照的 indev，仅为满足 LVGL 需要一个 pointer 设备的
+     * 场景；它不带任何控件交互（键盘/触摸板都是自绘自判），因此不会和触摸
+     * 任务抢 I2C —— 它读的是 gt911_get_last_sample() 的快照。
+     */
     lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.read_cb = touch_driver_read;
