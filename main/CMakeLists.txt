@@ -17,4 +17,4 @@ idf_component_register(
         "lv_font_kb_16.c"
     INCLUDE_DIRS "."
     REQUIRES lvgl_esp32_drivers esp32s3_soc lvgl esp_lcd
-    PRIV_REQUIRES nvs_flash esp_timer esp_hid bt driver)
+    PRIV_REQUIRES nvs_flash esp_timer esp_hid bt driver esp_driver_gpio)

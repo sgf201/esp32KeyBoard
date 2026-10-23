@@ -64,8 +64,12 @@ static const char *TAG = "KB";
 #define HID_AXIS_MAX        127
 #define HID_MAX_KEYS        6
 
-/* 触摸扫描周期 */
-#define TOUCH_TASK_PERIOD_MS 15
+/* 触摸扫描周期。
+ *
+ * 取值需要权衡：GT911 的触摸扫描约 100Hz，但主机读状态寄存器会清掉
+ * buffer-ready，读得太频繁会打断控制器内部的状态机推进——实测 15ms 时
+ * 会出现状态寄存器卡在 0x80、触点数恒为 0 的现象。放宽到 30ms 后恢复正常。 */
+#define TOUCH_TASK_PERIOD_MS 30
 
 /* 任务栈与优先级 */
 #define TOUCH_TASK_STACK    (1024 * 4)
@@ -132,6 +136,14 @@ static SemaphoreHandle_t s_state_lock = NULL;   /* 保护上面的按键状态 *
 static SemaphoreHandle_t s_gui_lock = NULL;     /* 注入自 main.c 的 LVGL 锁 */
 static volatile bool     s_visual_dirty = false;
 
+/* 模式切换请求：触摸任务只置标志，真正的布局变更在 LVGL 定时器里做。
+ * LVGL 不是线程安全的，跨任务直接改对象会和 lv_timer_handler 撞车。 */
+static volatile bool     s_mode_pending = false;
+static volatile kb_mode_t s_pending_mode = KB_MODE_SPLIT;
+
+/* apply_mode 定义在文件后部，但视觉刷新定时器要用它切换布局 */
+static void apply_mode(kb_mode_t mode);
+
 /* ---------------------------------------------------------------------------
  * UI 对象
  * ------------------------------------------------------------------------- */
@@ -194,6 +206,48 @@ static bool point_in_touchpad(int px, int py)
     lv_area_t a;
     lv_obj_get_coords(s_touchpad, &a);
     return px >= a.x1 && px <= a.x2 && py >= a.y1 && py <= a.y2;
+}
+
+/* ---------------------------------------------------------------------------
+ * 底部模式栏的命中测试
+ *
+ * 因为 LVGL 的 indev 被禁用了（多指需要自主处理触摸），模式栏的 btnmatrix
+ * 收不到任何点击事件 —— 所以必须在这里自己判断落在哪个按钮上。
+ * 三个按钮等分整个模式栏宽度。
+ * ------------------------------------------------------------------------- */
+static int hit_test_mode_bar(int px, int py)
+{
+    if (s_mode_btnm == NULL) {
+        return -1;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(s_mode_btnm, &a);
+    if (px < a.x1 || px > a.x2 || py < a.y1 || py > a.y2) {
+        return -1;
+    }
+    int w = a.x2 - a.x1 + 1;
+    if (w <= 0) {
+        return -1;
+    }
+    int idx = (px - a.x1) * 3 / w;   /* 分屏 / 全键盘 / 全触摸板 */
+    return (idx >= 0 && idx < 3) ? idx : -1;
+}
+
+/* 全屏触摸板模式下，底部左/右键按钮的命中测试 */
+static int hit_test_click_row(int px, int py)
+{
+    if (s_click_row == NULL || lv_obj_has_flag(s_click_row, LV_OBJ_FLAG_HIDDEN)) {
+        return -1;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(s_click_row, &a);
+    if (px < a.x1 || px > a.x2 || py < a.y1 || py > a.y2) {
+        return -1;
+    }
+    int w = a.x2 - a.x1 + 1;
+    int cx = a.x1 + w / 2;
+    /* 两个 150px 按钮居中对齐，间距 8px；以中点为界判断左右即可 */
+    return (px < cx) ? 0 : 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -270,6 +324,7 @@ static void trigger_special_key(int16_t key)
 
 typedef struct {
     bool       used;
+    bool       mapped;      /* 是否已做过落点判定（避免每轮重复判定） */
     uint8_t    track_id;
     int        key_idx;
     bool       on_touchpad;
@@ -301,8 +356,15 @@ static void release_track(track_t *t)
     }
 
     t->used = false;
+    t->mapped = false;
     t->key_idx = -1;
     t->on_touchpad = false;
+    /* 必须清零 moved：槽位会被下一个触点复用，若残留旧值，
+     * 新建触点时 `fresh` 判定（moved == 0）会失败，
+     * 导致该触点永远不进入命中测试、按键点了没反应。 */
+    t->moved = 0;
+    t->last.x = 0;
+    t->last.y = 0;
     s_visual_dirty = true;
 }
 
@@ -371,7 +433,14 @@ static void touch_task(void *arg)
             }
         }
 
-        if (sret == ESP_OK && td.count > 0) {
+        /* 触点跟踪。
+         *
+         * 关键：这段不能放在 td.count > 0 的条件里。
+         * 手指抬起后 count 变成 0，如果只在「有触点」时才处理，就永远不会
+         * 执行「未出现的触点 -> 抬起」的收尾逻辑，表现为按键一直保持按下、
+         * HID 报告停在最后一个键上（主机侧看到某个键卡住）。
+         */
+        {
             bool seen[MAX_TRACKED] = {0};
 
             for (uint8_t i = 0; i < td.count; i++) {
@@ -409,10 +478,17 @@ static void touch_task(void *arg)
                 }
                 seen[slot] = true;
 
-                bool fresh = (t->moved == 0 && t->key_idx == -1 && !t->on_touchpad);
+                /* 判断这是不是一个「刚刚按下」的触点。
+                 *
+                 * 用 t->key_idx 和 t->on_touchpad 都为初始值来判断不可靠：
+                 * 触点落在空白区域时两者都保持 -1/false，于是每一轮都会被
+                 * 当成新按下，重复走命中测试。
+                 *
+                 * 因此引入显式的 mapped 标志：只有「本次循环新建的槽位」
+                 * 才需要做落点判定。 */
+                if (!t->mapped) {
+                    t->mapped = true;
 
-                /* 新触点：判定落点 */
-                if (fresh) {
                     int idx = hit_test_key(px, py);
                     if (idx >= 0) {
                         t->key_idx = idx;
@@ -431,8 +507,24 @@ static void touch_task(void *arg)
                             trigger_special_key(key);
                         }
                         s_visual_dirty = true;
-                    } else if (point_in_touchpad(px, py)) {
-                        t->on_touchpad = true;
+                    } else {
+                        /* 先看是否落在底部模式栏 */
+                        int m = hit_test_mode_bar(px, py);
+                        if (m >= 0) {
+                            /* 模式切换必须在 LVGL 上下文执行：这里只置一个
+                             * 待处理请求，由 visual_refresh 定时器真正切换。 */
+                            s_pending_mode = (kb_mode_t)m;
+                            s_mode_pending = true;
+                        } else {
+                            /* 再看全屏触摸板模式下的左/右键 */
+                            int c = hit_test_click_row(px, py);
+                            if (c >= 0) {
+                                ble_hid_mouse_click(c == 0 ? BLE_HID_MOUSE_LEFT
+                                                           : BLE_HID_MOUSE_RIGHT);
+                            } else if (point_in_touchpad(px, py)) {
+                                t->on_touchpad = true;
+                            }
+                        }
                     }
                 }
 
@@ -458,7 +550,11 @@ static void touch_task(void *arg)
                 }
             }
 
-            /* 未出现的触点视为抬起 */
+            /* 未出现的触点视为抬起。
+             *
+             * 采样失败（sret != ESP_OK）时 td.count 保持为 0，所有已记录的
+             * 触点都会被释放 —— 这是期望行为：宁可松开按键，也不能让按键
+             * 卡在按下状态。 */
             for (int k = 0; k < MAX_TRACKED; k++) {
                 if (s_tracks[k].used && !seen[k]) {
                     release_track(&s_tracks[k]);
@@ -479,6 +575,14 @@ static void touch_task(void *arg)
 static void visual_refresh_cb(lv_timer_t *t)
 {
     (void)t;
+
+    /* 先处理触摸任务提交的模式切换请求。
+     * 布局变更涉及大量 LVGL 调用，必须在 LVGL 上下文执行。 */
+    if (s_mode_pending) {
+        s_mode_pending = false;
+        apply_mode(s_pending_mode);
+    }
+
     if (s_btnmatrix == NULL) {
         return;
     }
@@ -732,13 +836,18 @@ void kb_ui_create(void)
     s_btnmatrix = lv_btnmatrix_create(s_kb_container);
     lv_btnmatrix_set_map(s_btnmatrix, kb_map);
     lv_obj_set_size(s_btnmatrix, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_all(s_btnmatrix, 1, 0);
+
+    /* 同模式栏：btnmatrix 自身背景必须透明，否则主题底色会盖住按钮边界 */
+    lv_obj_set_style_bg_opa(s_btnmatrix, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_btnmatrix, 0, 0);
+    lv_obj_set_style_pad_all(s_btnmatrix, 0, 0);
     lv_obj_set_style_pad_row(s_btnmatrix, 3, 0);
     lv_obj_set_style_pad_column(s_btnmatrix, 3, 0);
-    lv_obj_set_style_text_font(s_btnmatrix, &lv_font_kb_16, LV_PART_ITEMS);
 
+    lv_obj_set_style_bg_opa(s_btnmatrix, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_btnmatrix, lv_color_hex(0x2C3E50), LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_btnmatrix, lv_color_hex(0xECF0F1), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(s_btnmatrix, &lv_font_kb_16, LV_PART_ITEMS);
     lv_obj_set_style_radius(s_btnmatrix, 5, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_btnmatrix, lv_color_hex(0x3498DB),
                               LV_PART_ITEMS | LV_STATE_CHECKED);
@@ -799,19 +908,38 @@ void kb_ui_create(void)
     lv_obj_set_style_bg_color(mode_bar, lv_color_hex(0x1E2A38), 0);
     lv_obj_set_style_border_width(mode_bar, 0, 0);
     lv_obj_set_style_radius(mode_bar, 0, 0);
-    lv_obj_set_style_pad_all(mode_bar, 3, 0);
+    lv_obj_set_style_pad_all(mode_bar, 4, 0);
     lv_obj_clear_flag(mode_bar, LV_OBJ_FLAG_SCROLLABLE);
 
     static const char *mode_map[] = {"分屏", "全键盘", "全触摸板", ""};
     s_mode_btnm = lv_btnmatrix_create(mode_bar);
     lv_btnmatrix_set_map(s_mode_btnm, mode_map);
     lv_obj_set_size(s_mode_btnm, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_text_font(s_mode_btnm, &lv_font_kb_16, LV_PART_ITEMS);
+
+    /* btnmatrix 自身背景必须透明，否则它会用主题默认底色覆盖整块区域，
+     * 让按钮看不出边界（表现为「按钮看不见」）。 */
+    lv_obj_set_style_bg_opa(s_mode_btnm, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_mode_btnm, 0, 0);
+    lv_obj_set_style_pad_all(s_mode_btnm, 0, 0);
+    lv_obj_set_style_pad_row(s_mode_btnm, 0, 0);
+    lv_obj_set_style_pad_column(s_mode_btnm, 6, 0);
+
+    /* 未选中：深灰蓝底 + 亮白字，保证对比度足够 */
+    lv_obj_set_style_bg_opa(s_mode_btnm, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_mode_btnm, lv_color_hex(0x34495E), LV_PART_ITEMS);
-    lv_obj_set_style_text_color(s_mode_btnm, lv_color_hex(0xECF0F1), LV_PART_ITEMS);
-    lv_obj_set_style_radius(s_mode_btnm, 4, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(s_mode_btnm, lv_color_white(), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(s_mode_btnm, &lv_font_kb_16, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_mode_btnm, 5, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(s_mode_btnm, 1, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(s_mode_btnm, lv_color_hex(0x5D6D7E),
+                                  LV_PART_ITEMS);
+
+    /* 选中：亮蓝底，明确指示当前模式 */
     lv_obj_set_style_bg_color(s_mode_btnm, lv_color_hex(0x2980B9),
                               LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(s_mode_btnm, lv_color_white(),
+                                LV_PART_ITEMS | LV_STATE_CHECKED);
+
     for (uint32_t i = 0; i < 3; i++) {
         lv_btnmatrix_set_btn_ctrl(s_mode_btnm, i, LV_BTNMATRIX_CTRL_CHECKABLE);
     }

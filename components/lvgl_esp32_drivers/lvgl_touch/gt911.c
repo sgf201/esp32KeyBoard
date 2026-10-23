@@ -323,16 +323,22 @@ esp_err_t gt911_read_points(gt911_touch_data_t *out)
 
     /* Bit 7 = buffer ready；低 4 位 = 本次上报的触点数。
      *
-     * 这里有个容易写错的地方：buffer-ready 置位但低 4 位为 0，表示控制器
-     * 「已检测到触摸、但坐标尚未算完」。此时绝不能写 0 清标志——GT911 的
-     * 状态寄存器是读后由主机写 0 确认的，提前清掉会让它一直无法完成这次
-     * 报告，表现为状态恒 0、触摸完全失灵。
+     * 关键：GT911 的状态机要求主机在每次读取后写 0 确认（release buffer），
+     * 它才能latch 下一次采样。出厂代码的条件是
+     *     if ((status & 0x80) || (count < 6)) write 0
+     * 实际上几乎等于「每次都清」。如果只在 buffer-ready 置位时才清，
+     * 控制器会卡在 0x80 不再更新，表现为触点数恒为 0、触摸完全失灵。
      *
-     * 因此只在真正读到有效坐标之后才清标志。 */
+     * 所以这里保留「几乎总是清零」的语义：只要不是明确的满 6 点，
+     * 读完就写 0。 */
     uint8_t count = status_reg & GT911_STATUS_REG_PT_MASK;
+
     if ((status_reg & GT911_STATUS_REG_BUF) == 0 || count == 0) {
-        /* 没有可用的新数据。不写 0，把清标志的机会留给下一个完整周期。
-         * 仅当明确「无触摸」时才清（此时低 4 位为 0、bit7 也为 0 是常态）。 */
+        /* 没有有效坐标，但仍要确认一次，让控制器继续推进状态机。
+         * 注意这里不做「count 保留上一帧」的处理——调用方按 count==0
+         * 判定为无触摸即可。 */
+        gt911_i2c_write8(gt911_status.i2c_dev_addr, GT911_STATUS_REG, 0x00);
+
         taskENTER_CRITICAL(&s_sample_mux);
         s_last_sample.count = 0;
         s_sample_valid = true;

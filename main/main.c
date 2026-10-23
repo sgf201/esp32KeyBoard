@@ -77,12 +77,15 @@ void lvgl_task(void *pvParameter)
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
 
-#if CONFIG_LV_TOUCH_CONTROLLER != TOUCH_CONTROLLER_NONE
-    /* 触摸的采样全部由 kb_keypad 的触摸任务负责（gt911_sample_now）。
+#if 0
+    /* 触摸不注册为 LVGL 的 indev。
      *
-     * 这里注册一个只读快照的 indev，仅为满足 LVGL 需要一个 pointer 设备的
-     * 场景；它不带任何控件交互（键盘/触摸板都是自绘自判），因此不会和触摸
-     * 任务抢 I2C —— 它读的是 gt911_get_last_sample() 的快照。
+     * 两个原因：
+     * 1. LVGL v8 是单点输入模型（一个 lv_point_t），无法表达多指同按；
+     * 2. GT911 的状态寄存器是读后清零的，indev 与 kb_keypad 的触摸任务
+     *    同时读取会互相偷采样，实测会导致两边都拿不到数据。
+     *
+     * 触摸的采样与命中测试全部由 kb_keypad 的触摸任务负责。
      */
     lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
@@ -207,7 +210,17 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* GT911 硬件复位。
+     *
+     * 用厂商库的 GT911_RST()：它是出厂固件里验证过的序列，操作 GPIO 4/5
+     * 产生复位脉冲并在释放时以 INT=1 选定 I2C 地址 0x5D。
+     *
+     * 注意它开头会把 GPIO 6（背光）拉低，所以必须在 lvgl_task 之前调用——
+     * lvgl_task 里会重新把背光拉高。若要跳过背光操作可改用
+     * gt911_hw_reset()（本工程自带实现），但实测它对 INT 的处理更敏感，
+     * 容易出现地址落在 0x14 导致探测不到设备。 */
     GT911_RST();
+
     xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 1024 * 6, NULL, 5, NULL, 1);
 
     /* Verify the GT911 5-point path runs parallel to the normal LVGL input. */
